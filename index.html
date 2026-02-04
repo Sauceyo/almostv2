@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
-  <title>ALMOST — Prototype v2.2 (Solvable)</title>
+  <title>ALMOST: MISSTEP — Prototype</title>
   <style>
     html, body { margin:0; padding:0; background:#0b0b10; height:100%; overflow:hidden; }
     canvas { display:block; width:100vw; height:100vh; touch-action:manipulation; }
@@ -33,82 +33,218 @@
     score: 0,
     best: 0,
     lastMissPx: null,
-
-    speed: 260,
-    speedRamp: 8,
-
-    // spawn controls
-    spawnEvery: 0.98,
-    spawnMin: 0.68,
-    spawnTighten: 0.015,
-
-    // slot sizing
-    slotH: 170,
-    slotMin: 110,
-    slotShrink: 1.8,
-
-    // proximity scoring
-    closePx: 14,
-    almostPx: 6,
-
-    // fairness constraints
-    // max allowed change in slot center between consecutive shutters (px)
-    maxSlotDeltaBase: 180,
-    maxSlotDeltaMin: 115,
-
-    // drift controls
-    driftAmpBase: 18,
-    driftAmpMin: 4,
-
     flash: 0,
     shake: 0,
     t: 0,
+
+    // "forward" motion: segments move toward player
+    worldSpeed: 420, // px/s (visual forward speed)
+    speedRamp: 6,    // per segment passed
+
+    // difficulty: drift grows over time
+    driftBase: 160,        // px/s^2
+    driftRamp: 14,         // increases with score
+    driftMax: 820,         // cap
+    driftDir: 1,           // current lean direction (+1 right / -1 left)
+    driftFlipChance: 0.22, // chance to flip direction on each new segment
+
+    // correction impulse
+    correction: 540,   // px/s impulse toward center
+    imperfection: 0.22, // % randomness in correction
+
+    // scoring tiers (distance from edge at tap time, in px)
+    closePx: 18,
+    almostPx: 8,
   };
 
+  // Player lives near bottom; only x changes.
   const player = {
-    x: 140,
-    y: 200,
-    r: 13,
-    vy: 0,
-
-    gravity: 1700,
-    flapImpulse: 540,
-    maxFall: 1200,
+    x: 0,
+    y: 0,
+    r: 12,
+    vx: 0,
+    // friction keeps things controllable
+    friction: 7.5, // higher = snappier damp
   };
 
-  let shutters = [];
-  let spawnTimer = 0;
+  // Track segments define where the beam is.
+  // Each segment has a centerX and halfWidth at that depth.
+  let segments = [];
 
-  const neon = ['#2cffc7', '#7c5cff', '#ff3d81', '#ffd54a', '#4ad7ff'];
-  const pick = () => neon[(Math.random()*neon.length)|0];
+  // Perspective mapping: world Z -> screen Y and scale
+  function zToY(z) {
+    // z=0 at player, increases away from player (up screen)
+    // We map so far segments are near top and small
+    const H = window.innerHeight;
+    const nearY = H * 0.82;  // player line
+    const farY  = H * 0.12;  // horizon
+    const t = clamp(z / 1200, 0, 1); // 0..1
+    // ease so movement feels depthy
+    const e = t*t*(3-2*t);
+    return nearY + (farY - nearY) * e;
+  }
+
+  function zToScale(z) {
+    // scale smaller as z increases
+    const t = clamp(z / 1200, 0, 1);
+    return 1.0 - 0.62 * t;
+  }
+
+  function currentTrackAtPlayer() {
+    // Find segment spanning z ~ 0
+    // Our segments are ordered by zStart..zEnd
+    for (const s of segments) {
+      if (0 >= s.zStart && 0 < s.zEnd) return s;
+    }
+    // Fallback: nearest
+    return segments.length ? segments[0] : null;
+  }
 
   function reset() {
     state.running = true;
     state.score = 0;
     state.lastMissPx = null;
-
-    state.speed = 260;
-    state.spawnEvery = 0.98;
-    state.slotH = 170;
-
     state.flash = 0;
     state.shake = 0;
     state.t = 0;
 
-    player.y = window.innerHeight * 0.5;
-    player.vy = 0;
+    state.worldSpeed = 420;
+    state.driftDir = Math.random() < 0.5 ? -1 : 1;
 
-    shutters = [];
-    spawnTimer = 0.25;
+    player.y = window.innerHeight * 0.82;
+    player.x = window.innerWidth * 0.5;
+    player.vx = 0;
 
-    // seed a first shutter near center so it feels fair immediately
-    spawnShutter(true);
+    segments = [];
+    seedSegments();
+  }
+
+  function seedSegments() {
+    const W = window.innerWidth;
+
+    // Beam "design" is defined in world space:
+    // z goes from near (- small) to far (+).
+    // We'll keep a chain from z=-200 to z=1600
+    let z = -200;
+    let center = W * 0.5;
+    let halfW = 120;
+
+    for (let i = 0; i < 10; i++) {
+      const len = 180 + Math.random() * 120; // segment length in z
+      const nextCenter = clamp(
+        center + (Math.random()*2 - 1) * 160,
+        W * 0.20,
+        W * 0.80
+      );
+      const nextHalfW = clamp(
+        halfW + (Math.random()*2 - 1) * 28,
+        64,
+        150
+      );
+
+      segments.push({
+        zStart: z,
+        zEnd: z + len,
+        c0: center,
+        c1: nextCenter,
+        w0: halfW,
+        w1: nextHalfW,
+        // subtle texture seed
+        tint: (Math.random()*0.15) + 0.07
+      });
+
+      z += len;
+      center = nextCenter;
+      halfW = nextHalfW;
+    }
+  }
+
+  function extendSegmentsIfNeeded() {
+    const W = window.innerWidth;
+    // ensure we have enough far segments
+    let farEnd = segments.length ? segments[segments.length - 1].zEnd : 0;
+    while (farEnd < 1700) {
+      const last = segments[segments.length - 1];
+
+      const len = 170 + Math.random() * 140;
+      const lastCenter = last ? last.c1 : W*0.5;
+      const lastHalfW  = last ? last.w1 : 120;
+
+      // fairness: limit how much center shifts per segment based on difficulty
+      const maxShift = clamp(190 - state.score * 1.8, 80, 190);
+
+      let nextCenter = clamp(
+        lastCenter + (Math.random()*2 - 1) * maxShift,
+        W * 0.18,
+        W * 0.82
+      );
+
+      let nextHalfW = clamp(
+        lastHalfW + (Math.random()*2 - 1) * 26,
+        58,
+        150
+      );
+
+      segments.push({
+        zStart: farEnd,
+        zEnd: farEnd + len,
+        c0: lastCenter,
+        c1: nextCenter,
+        w0: lastHalfW,
+        w1: nextHalfW,
+        tint: (Math.random()*0.15) + 0.07
+      });
+
+      farEnd += len;
+    }
+  }
+
+  function maybeFlipDriftOnPass() {
+    if (Math.random() < state.driftFlipChance) state.driftDir *= -1;
   }
 
   function action() {
     if (!state.running) { reset(); return; }
-    player.vy = -player.flapImpulse;
+
+    const track = currentTrackAtPlayer();
+    if (!track) return;
+
+    // compute center & edge distance at tap moment (for scoring)
+    const center = lerp(track.c0, track.c1, 0.5); // approximation for z~0 slice
+    const halfW  = lerp(track.w0, track.w1, 0.5);
+
+    const edgeDist = halfW - Math.abs(player.x - center) - player.r; // inside margin
+    awardTapScore(edgeDist);
+
+    // Apply correction impulse toward center, with imperfection
+    const dir = (center - player.x);
+    const sign = dir === 0 ? 0 : (dir > 0 ? 1 : -1);
+
+    // randomness makes it feel “human” and prevents perfect autopilot play
+    const noise = (Math.random()*2 - 1) * state.imperfection;
+
+    player.vx += sign * state.correction * (1 + noise);
+
+    // Small kick also slightly reduces speed runaway
+    state.flash = Math.max(state.flash, 0.06);
   }
+
+  function awardTapScore(edgeDist) {
+    // If edgeDist is negative, you're already off (will die), but guard anyway
+    if (edgeDist <= state.almostPx) {
+      state.score += 3;
+      state.flash = 0.10;
+      state.shake = 7;
+    } else if (edgeDist <= state.closePx) {
+      state.score += 2;
+      state.flash = Math.max(state.flash, 0.05);
+    } else {
+      state.score += 1;
+    }
+  }
+
+  function lerp(a,b,t){ return a + (b-a)*t; }
+
   window.addEventListener('pointerdown', (e)=>{ e.preventDefault(); action(); }, {passive:false});
   window.addEventListener('keydown', (e)=>{
     if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); action(); }
@@ -119,81 +255,7 @@
     state.best = Math.max(state.best, state.score);
     state.lastMissPx = missPx;
     state.flash = 0.28;
-    state.shake = 11;
-  }
-
-  function applyRamp() {
-    state.speed += state.speedRamp;
-    state.spawnEvery = Math.max(state.spawnMin, state.spawnEvery - state.spawnTighten);
-    state.slotH = Math.max(state.slotMin, state.slotH - state.slotShrink);
-  }
-
-  function tierScore(edgeDist) {
-    if (edgeDist <= state.almostPx) {
-      state.score += 3; state.flash = 0.09; state.shake = 7;
-    } else if (edgeDist <= state.closePx) {
-      state.score += 2;
-    } else {
-      state.score += 1;
-    }
-    applyRamp();
-  }
-
-  function currentMaxSlotDelta() {
-    // As speed increases, reduce how far the next slot can move
-    // This prevents impossible “teleport” demands.
-    // Map speed ~260..600 -> delta ~base..min
-    const t = clamp((state.speed - 260) / 340, 0, 1);
-    return state.maxSlotDeltaBase + (state.maxSlotDeltaMin - state.maxSlotDeltaBase) * t;
-  }
-
-  function currentDriftAmp() {
-    // Reduce drift as difficulty rises to keep it fair
-    const t = clamp((state.speed - 260) / 340, 0, 1);
-    return state.driftAmpBase + (state.driftAmpMin - state.driftAmpBase) * t;
-  }
-
-  function minSpawnTimeForReaction() {
-    // Guarantee at least this much time between shutters based on how fast
-    // the player can reasonably change altitude (tap impulse + gravity).
-    // This is a *heuristic* but works well.
-    // As speed rises, require a little MORE time, not less.
-    const t = clamp((state.speed - 260) / 340, 0, 1);
-    return 0.72 + 0.12 * t; // 0.72s early -> 0.84s late
-  }
-
-  function spawnShutter(isFirst=false) {
-    const W = window.innerWidth, H = window.innerHeight;
-    const slotH = Math.max(state.slotMin, state.slotH);
-    const margin = 70;
-
-    const prev = shutters.length ? shutters[shutters.length - 1] : null;
-    const prevCenter = prev ? (prev.slotY + prev.slotH/2) : (H/2);
-
-    // Constrain next slot center to prevent impossible jumps
-    const maxDelta = currentMaxSlotDelta();
-    const minCenter = clamp(prevCenter - maxDelta, margin + slotH/2, H - margin - slotH/2);
-    const maxCenter = clamp(prevCenter + maxDelta, margin + slotH/2, H - margin - slotH/2);
-
-    // choose within constrained range
-    let center;
-    if (isFirst) center = H/2;
-    else center = minCenter + Math.random() * (maxCenter - minCenter);
-
-    const slotY = clamp(center - slotH/2, margin, H - margin - slotH);
-
-    shutters.push({
-      x: W + 60,
-      w: 92,
-      slotY,
-      slotH,
-      color: pick(),
-      passed: false,
-
-      driftAmp: currentDriftAmp(),
-      driftSpd: 0.9 + Math.random()*0.6,
-      driftPhase: Math.random()*Math.PI*2,
-    });
+    state.shake = 12;
   }
 
   let lastT = performance.now();
@@ -214,58 +276,62 @@
 
     if (!state.running) return;
 
-    // physics
-    player.vy += player.gravity * dt;
-    player.vy = clamp(player.vy, -2000, player.maxFall);
-    player.y += player.vy * dt;
-
-    const H = window.innerHeight;
-    if (player.y < player.r + 6) endRun(Math.abs(player.y - (player.r + 6)));
-    if (player.y > H - (player.r + 6)) endRun(Math.abs(player.y - (H - (player.r + 6))));
-
-    // spawn timer with solvability floor
-    spawnTimer -= dt;
-    const minTime = minSpawnTimeForReaction();
-    const effectiveEvery = Math.max(state.spawnEvery, minTime);
-
-    if (spawnTimer <= 0) {
-      spawnTimer = effectiveEvery;
-      spawnShutter(false);
+    // Move world toward player (decrease z)
+    const dz = state.worldSpeed * dt;
+    for (const s of segments) {
+      s.zStart -= dz;
+      s.zEnd   -= dz;
     }
 
-    // move / cull
-    for (const s of shutters) s.x -= state.speed * dt;
-    while (shutters.length && shutters[0].x < -250) shutters.shift();
+    // Cull segments behind player
+    while (segments.length && segments[0].zEnd < -260) segments.shift();
 
-    // collision + scoring
-    for (const s of shutters) {
-      const drift = Math.sin(state.t*s.driftSpd + s.driftPhase) * s.driftAmp;
-      const slotY = s.slotY + drift;
-      const slotTop = slotY;
-      const slotBot = slotY + s.slotH;
+    // Extend ahead
+    extendSegmentsIfNeeded();
 
-      // aligned in x?
-      if (player.x + player.r < s.x || player.x - player.r > s.x + s.w) continue;
+    // Drift acceleration grows with score, but capped
+    const driftAcc = clamp(state.driftBase + state.score * state.driftRamp, state.driftBase, state.driftMax);
+    player.vx += state.driftDir * driftAcc * dt;
 
-      const inside = (player.y - player.r >= slotTop) && (player.y + player.r <= slotBot);
+    // Damping
+    const damp = Math.exp(-player.friction * dt);
+    player.vx *= damp;
 
-      if (!inside) {
-        let missPx = 0;
-        if (player.y < slotTop) missPx = (slotTop - (player.y + player.r));
-        else if (player.y > slotBot) missPx = ((player.y - player.r) - slotBot);
-        missPx = Math.max(0, missPx);
-        endRun(missPx);
-        return;
-      }
+    // Integrate
+    player.x += player.vx * dt;
 
-      if (!s.passed && (s.x + s.w/2) < player.x) {
+    // Determine beam at player (z~0)
+    const track = currentTrackAtPlayer();
+    if (!track) return;
+
+    // compute beam center/width at z=0 by interpolating along the segment
+    const segT = clamp((0 - track.zStart) / (track.zEnd - track.zStart), 0, 1);
+    const center = lerp(track.c0, track.c1, segT);
+    const halfW  = lerp(track.w0, track.w1, segT);
+
+    // Edge distance (inside)
+    const edgeDist = halfW - Math.abs(player.x - center) - player.r;
+
+    // If off beam => death
+    if (edgeDist < 0) {
+      endRun(Math.abs(edgeDist));
+      return;
+    }
+
+    // Increase speed gradually as you survive (feels like forward tension)
+    // But don't accelerate too hard; this game is about restraint not reaction
+    state.worldSpeed += 0.8 * dt;
+
+    // “Pass” events: when a segment’s end crosses z=0, ramp difficulty gently
+    // We'll detect by checking a segment that just crossed.
+    // Simple: if any segment has zStart < 0 and zEnd > 0, we’re in it; when zEnd crosses below 0, we passed it.
+    // We'll award a tiny speed ramp on pass by tracking last segment id via position threshold.
+    // (Lightweight: use a marker on segments once their zEnd goes below 0.)
+    for (const s of segments) {
+      if (!s.passed && s.zEnd < 0) {
         s.passed = true;
-
-        const edgeDist = Math.min(
-          (player.y - player.r) - slotTop,
-          slotBot - (player.y + player.r)
-        );
-        tierScore(edgeDist);
+        state.worldSpeed += state.speedRamp;
+        maybeFlipDriftOnPass();
       }
     }
   }
@@ -278,6 +344,7 @@
       sx = (Math.random()-0.5)*state.shake;
       sy = (Math.random()-0.5)*state.shake;
     }
+
     ctx.save();
     ctx.translate(sx, sy);
 
@@ -285,38 +352,88 @@
     ctx.fillStyle = '#0b0b10';
     ctx.fillRect(-50,-50,W+100,H+100);
 
-    // subtle diagonal scanlines
-    ctx.globalAlpha = 0.07;
-    ctx.strokeStyle = '#ffffff';
-    ctx.lineWidth = 1;
-    for (let i=-H; i<W; i+=28) {
-      ctx.beginPath();
-      ctx.moveTo(i, 0);
-      ctx.lineTo(i+H, H);
-      ctx.stroke();
-    }
+    // faint horizon haze
+    ctx.globalAlpha = 0.25;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, H*0.10, W, 2);
     ctx.globalAlpha = 1;
 
-    // shutters
-    for (const s of shutters) {
-      const drift = Math.sin(state.t*s.driftSpd + s.driftPhase) * s.driftAmp;
-      const slotY = s.slotY + drift;
+    // Draw beam as a ribbon in perspective using segment slices
+    // We'll sample z from far to near for a smooth look.
+    const samples = 34;
+    const zFar = 1200;
+    const zNear = -40;
 
-      ctx.fillStyle = '#141421';
-      ctx.fillRect(s.x, 0, s.w, H);
+    // Build left/right points
+    let leftPts = [];
+    let rightPts = [];
 
-      // safe slot
-      ctx.clearRect(s.x, slotY, s.w, s.slotH);
+    for (let i = 0; i <= samples; i++) {
+      const tz = zFar + (zNear - zFar) * (i / samples);
 
-      ctx.strokeStyle = s.color;
-      ctx.lineWidth = 3;
-      ctx.strokeRect(s.x + 2, slotY + 2, s.w - 4, s.slotH - 4);
+      // find segment containing tz
+      let seg = null;
+      for (const s of segments) {
+        if (tz >= s.zStart && tz < s.zEnd) { seg = s; break; }
+      }
+      if (!seg) continue;
 
-      ctx.fillStyle = s.color;
-      ctx.fillRect(s.x + s.w - 6, 0, 4, H);
+      const segT = clamp((tz - seg.zStart) / (seg.zEnd - seg.zStart), 0, 1);
+      const center = lerp(seg.c0, seg.c1, segT);
+      const halfW = lerp(seg.w0, seg.w1, segT);
+
+      const y = zToY(tz);
+      const sc = zToScale(tz);
+
+      leftPts.push({ x: center - halfW * sc, y });
+      rightPts.push({ x: center + halfW * sc, y });
     }
 
-    // player
+    // Beam fill
+    ctx.beginPath();
+    for (let i=0; i<leftPts.length; i++) {
+      const p = leftPts[i];
+      if (i===0) ctx.moveTo(p.x, p.y);
+      else ctx.lineTo(p.x, p.y);
+    }
+    for (let i=rightPts.length-1; i>=0; i--) {
+      const p = rightPts[i];
+      ctx.lineTo(p.x, p.y);
+    }
+    ctx.closePath();
+
+    ctx.fillStyle = '#141421';
+    ctx.fill();
+
+    // Beam edge glow
+    ctx.globalAlpha = 0.55;
+    ctx.strokeStyle = '#4ad7ff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i=0; i<leftPts.length; i++) {
+      const p = leftPts[i];
+      if (i===0) ctx.moveTo(p.x, p.y);
+      else ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+
+    ctx.beginPath();
+    for (let i=0; i<rightPts.length; i++) {
+      const p = rightPts[i];
+      if (i===0) ctx.moveTo(p.x, p.y);
+      else ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // Player shadow + player
+    ctx.globalAlpha = 0.25;
+    ctx.fillStyle = '#000';
+    ctx.beginPath();
+    ctx.ellipse(player.x, player.y + 14, 18, 8, 0, 0, Math.PI*2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+
     ctx.fillStyle = '#f2f2f5';
     ctx.beginPath();
     ctx.arc(player.x, player.y, player.r, 0, Math.PI*2);
@@ -324,39 +441,39 @@
 
     // HUD
     ctx.fillStyle = '#f2f2f5';
-    ctx.font = '700 22px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+    ctx.font = '800 22px system-ui, -apple-system, Segoe UI, Roboto, Arial';
     ctx.fillText(`Score: ${state.score}`, 18, 34);
-    ctx.globalAlpha = 0.75;
-    ctx.font = '600 16px system-ui, -apple-system, Segoe UI, Roboto, Arial';
-    ctx.fillText(`Best: ${state.best}`, 18, 56);
 
-    // debug-ish fairness readout (comment out later)
-    ctx.fillText(`Speed: ${Math.round(state.speed)}  Spawn: ${Math.max(state.spawnEvery, minSpawnTimeForReaction()).toFixed(2)}s`, 18, 78);
+    ctx.globalAlpha = 0.75;
+    ctx.font = '700 16px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+    ctx.fillText(`Best: ${state.best}`, 18, 56);
     ctx.globalAlpha = 1;
 
+    // instructions / game over
     if (state.running) {
       ctx.globalAlpha = 0.75;
-      ctx.font = '600 16px system-ui, -apple-system, Segoe UI, Roboto, Arial';
-      ctx.fillText('Tap = boost up. Hug edges for more points.', 18, H - 20);
+      ctx.font = '700 16px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+      ctx.fillText('Tap = correct drift. Closer to the edge when you tap = more points.', 18, H - 20);
       ctx.globalAlpha = 1;
     } else {
       ctx.globalAlpha = 0.95;
-      ctx.font = '900 56px system-ui, -apple-system, Segoe UI, Roboto, Arial';
-      ctx.fillText('ALMOST', 18, H * 0.35);
+      ctx.font = '900 52px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+      ctx.fillText('MISSTEP', 18, H * 0.35);
 
       ctx.globalAlpha = 0.85;
       ctx.font = '800 26px system-ui, -apple-system, Segoe UI, Roboto, Arial';
       const miss = (state.lastMissPx == null) ? '' : `Missed by ${Math.max(0, state.lastMissPx).toFixed(1)} px`;
-      ctx.fillText(miss, 18, H * 0.35 + 46);
+      ctx.fillText(miss, 18, H * 0.35 + 44);
 
       ctx.globalAlpha = 0.85;
-      ctx.font = '700 18px system-ui, -apple-system, Segoe UI, Roboto, Arial';
-      ctx.fillText('Tap to retry', 18, H * 0.35 + 80);
+      ctx.font = '800 18px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+      ctx.fillText('Tap to retry', 18, H * 0.35 + 76);
       ctx.globalAlpha = 1;
     }
 
+    // flash overlay
     if (state.flash > 0) {
-      ctx.globalAlpha = clamp(state.flash * 3.5, 0, 0.35);
+      ctx.globalAlpha = clamp(state.flash * 3.5, 0, 0.32);
       ctx.fillStyle = '#ffffff';
       ctx.fillRect(-50,-50,W+100,H+100);
       ctx.globalAlpha = 1;
