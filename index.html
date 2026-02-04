@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
-  <title>ALMOST: MISSTEP — v0.3 (Flip Lean)</title>
+  <title>ALMOST: DRIFT — Prototype v0.4</title>
   <style>
     html, body { margin:0; padding:0; background:#0b0b10; height:100%; overflow:hidden; }
     canvas { display:block; width:100vw; height:100vh; touch-action:manipulation; }
@@ -29,18 +29,18 @@
   window.addEventListener('resize', resize);
   resize();
 
-  // --- Perspective helpers ---
+  // Perspective helpers (road depth)
   function zToY(z) {
     const H = window.innerHeight;
-    const nearY = H * 0.82;
-    const farY  = H * 0.12;
-    const t = clamp(z / 1200, 0, 1);
+    const nearY = H * 0.84;   // car line
+    const farY  = H * 0.14;   // horizon
+    const t = clamp(z / 1300, 0, 1);
     const e = t*t*(3-2*t);
     return nearY + (farY - nearY) * e;
   }
   function zToScale(z) {
-    const t = clamp(z / 1200, 0, 1);
-    return 1.0 - 0.62 * t;
+    const t = clamp(z / 1300, 0, 1);
+    return 1.0 - 0.66 * t;
   }
 
   const state = {
@@ -53,95 +53,109 @@
     shake: 0,
     t: 0,
 
-    // forward motion
-    worldSpeed: 420,
+    // forward speed
+    roadSpeed: 440,
     speedRamp: 6,
     baseAccel: 0.75,
 
-    // BALANCE MECHANIC
-    // leanAcc is the sideways acceleration applied constantly.
-    leanAccBase: 900,     // px/s^2
-    leanAccRamp: 18,      // increases with score
-    leanAccMax: 1700,
+    // drift physics
+    leanAccBase: 820,     // px/s^2
+    leanAccRamp: 16,
+    leanAccMax: 1600,
+    friction: 4.2,
+    maxVx: 880,
 
-    // damping/cap so it's controllable
-    friction: 3.8,
-    maxVx: 860,
-
-    // scoring tiers (distance from edge when you flip)
+    // scoring
     closePx: 18,
     almostPx: 8,
 
-    // start safety
-    spawnGrace: 0.45,
+    // spawn + fairness
     graceLeft: 0,
+    spawnGrace: 0.65,      // longer so no instant deaths
+    warmupTime: 1.6,       // first N seconds = wide straight road
+    warmupLeft: 0,
+
+    // input reliability
+    tapCooldown: 0.09,     // debounce window
+    tapCoolLeft: 0,
   };
 
-  const player = {
+  const car = {
     x: 0,
     y: 0,
-    r: 12,
+    r: 12,      // collision radius
     vx: 0,
-    leanDir: 1, // +1 right / -1 left
+    driftDir: 1, // +1 right / -1 left
   };
 
+  // Road segments in Z (center + half width)
   let segments = [];
-
-  function seedSegments() {
-    const W = window.innerWidth;
-    let z = -220;
-    let center = W * 0.5;
-    let halfW = 135;
-
-    segments = [];
-    for (let i = 0; i < 12; i++) {
-      const len = 180 + Math.random() * 120;
-
-      // early fairness: gentle offsets
-      const maxShift = 110;
-      const nextCenter = clamp(center + (Math.random()*2 - 1) * maxShift, W*0.22, W*0.78);
-      const nextHalfW  = clamp(halfW + (Math.random()*2 - 1) * 16, 78, 175);
-
-      segments.push({ zStart:z, zEnd:z+len, c0:center, c1:nextCenter, w0:halfW, w1:nextHalfW });
-
-      z += len;
-      center = nextCenter;
-      halfW  = nextHalfW;
-    }
-  }
-
-  function extendSegmentsIfNeeded() {
-    const W = window.innerWidth;
-    let farEnd = segments.length ? segments[segments.length - 1].zEnd : 0;
-
-    while (farEnd < 1750) {
-      const last = segments[segments.length - 1];
-      const len = 170 + Math.random() * 140;
-
-      const lastCenter = last ? last.c1 : W*0.5;
-      const lastHalfW  = last ? last.w1 : 135;
-
-      // as score rises, reduce max shift so it stays fair at high speed
-      const maxShift = clamp(170 - state.score * 1.4, 85, 170);
-
-      const nextCenter = clamp(lastCenter + (Math.random()*2 - 1) * maxShift, W*0.18, W*0.82);
-      const nextHalfW  = clamp(lastHalfW + (Math.random()*2 - 1) * 20, 74, 185);
-
-      segments.push({ zStart:farEnd, zEnd:farEnd+len, c0:lastCenter, c1:nextCenter, w0:lastHalfW, w1:nextHalfW });
-      farEnd += len;
-    }
-  }
 
   function trackAtZ(z) {
     for (const s of segments) {
       if (z >= s.zStart && z < s.zEnd) {
         const segT = clamp((z - s.zStart) / (s.zEnd - s.zStart), 0, 1);
-        return { center: lerp(s.c0, s.c1, segT), halfW: lerp(s.w0, s.w1, segT), seg: s };
+        return {
+          center: lerp(s.c0, s.c1, segT),
+          halfW:  lerp(s.w0, s.w1, segT),
+          seg: s
+        };
       }
     }
     if (!segments.length) return null;
     const s = segments[0];
     return { center: s.c0, halfW: s.w0, seg: s };
+  }
+
+  function seedSegments() {
+    const W = window.innerWidth;
+    const mid = W * 0.5;
+
+    segments = [];
+    let z = -260;
+
+    // ✅ Warmup: straight + wide for first few segments (prevents spawn deaths)
+    let center = mid;
+    let halfW = 175;
+
+    for (let i=0; i<10; i++) {
+      const len = 190 + Math.random()*120;
+
+      let nextCenter = center;
+      let nextHalfW = halfW;
+
+      // after warmup distance, start introducing offsets + width variation
+      if (z > 500) {
+        const maxShift = clamp(170 - state.score * 1.4, 85, 170);
+        nextCenter = clamp(center + (Math.random()*2 - 1) * maxShift, W*0.18, W*0.82);
+        nextHalfW  = clamp(halfW + (Math.random()*2 - 1) * 20, 95, 190);
+      }
+
+      segments.push({ zStart:z, zEnd:z+len, c0:center, c1:nextCenter, w0:halfW, w1:nextHalfW });
+      z += len;
+      center = nextCenter;
+      halfW = nextHalfW;
+    }
+  }
+
+  function extendSegmentsIfNeeded() {
+    const W = window.innerWidth;
+    let farEnd = segments.length ? segments[segments.length-1].zEnd : 0;
+
+    while (farEnd < 1900) {
+      const last = segments[segments.length-1];
+      const len = 180 + Math.random()*140;
+
+      const lastCenter = last ? last.c1 : W*0.5;
+      const lastHalfW  = last ? last.w1 : 175;
+
+      const maxShift = clamp(170 - state.score * 1.4, 85, 170);
+      const nextCenter = clamp(lastCenter + (Math.random()*2 - 1) * maxShift, W*0.18, W*0.82);
+      const nextHalfW  = clamp(lastHalfW + (Math.random()*2 - 1) * 20, 90, 190);
+
+      segments.push({ zStart:farEnd, zEnd:farEnd+len, c0:lastCenter, c1:nextCenter, w0:lastHalfW, w1:nextHalfW });
+      farEnd += len;
+    }
   }
 
   function reset() {
@@ -152,20 +166,23 @@
     state.shake = 0;
     state.t = 0;
 
-    state.worldSpeed = 420;
+    state.roadSpeed = 440;
     state.graceLeft = state.spawnGrace;
+    state.warmupLeft = state.warmupTime;
 
-    player.y = window.innerHeight * 0.82;
-    player.vx = 0;
-    player.leanDir = Math.random() < 0.5 ? -1 : 1;
+    state.tapCoolLeft = 0;
+
+    car.y = window.innerHeight * 0.84;
+    car.vx = 0;
+    car.driftDir = Math.random() < 0.5 ? -1 : 1;
 
     seedSegments();
     extendSegmentsIfNeeded();
 
-    // snap onto track center so you never spawn dead
+    // ✅ Place car safely in lane center
     const tr = trackAtZ(0);
-    const pad = player.r + 6;
-    player.x = clamp(tr.center, tr.center - (tr.halfW - pad), tr.center + (tr.halfW - pad));
+    const pad = car.r + 8;
+    car.x = clamp(tr.center, tr.center - (tr.halfW - pad), tr.center + (tr.halfW - pad));
   }
 
   function endRun(missPx) {
@@ -177,7 +194,6 @@
   }
 
   function awardFlipScore(edgeDist) {
-    // smaller edgeDist = closer to falling = more points
     if (edgeDist <= state.almostPx) {
       state.score += 3; state.flash = 0.10; state.shake = 7;
     } else if (edgeDist <= state.closePx) {
@@ -187,21 +203,31 @@
     }
   }
 
+  // ✅ Robust action: debounce + ignore multi-touch double fires
   function action() {
     if (!state.running) { reset(); return; }
+    if (state.tapCoolLeft > 0) return;
 
-    // Flip lean direction (THIS gives you agency)
-    player.leanDir *= -1;
+    state.tapCoolLeft = state.tapCooldown;
 
-    // score based on how close you were to the edge when you flipped
+    // Flip drift direction reliably
+    car.driftDir *= -1;
+
+    // Score based on closeness to edge when flipping
     const tr = trackAtZ(0);
     if (tr) {
-      const edgeDist = tr.halfW - Math.abs(player.x - tr.center) - player.r;
+      const edgeDist = tr.halfW - Math.abs(car.x - tr.center) - car.r;
       awardFlipScore(edgeDist);
     }
   }
 
-  window.addEventListener('pointerdown', (e)=>{ e.preventDefault(); action(); }, {passive:false});
+  window.addEventListener('pointerdown', (e)=>{
+    if (e.isPrimary === false) return; // ignore secondary touch
+    e.preventDefault();
+    action();
+  }, { passive:false });
+
+  window.addEventListener('pointercancel', ()=>{/* no-op but prevents stuck gestures */});
   window.addEventListener('keydown', (e)=>{
     if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); action(); }
   });
@@ -210,10 +236,8 @@
   function tick(t) {
     const dt = Math.min(0.033, (t-lastT)/1000);
     lastT = t;
-
     update(dt);
     render();
-
     requestAnimationFrame(tick);
   }
 
@@ -221,59 +245,64 @@
     state.t += dt;
     state.flash = Math.max(0, state.flash - dt);
     state.shake = Math.max(0, state.shake - dt*30);
+    state.tapCoolLeft = Math.max(0, state.tapCoolLeft - dt);
+
     if (!state.running) return;
 
-    // move world toward player
-    const dz = state.worldSpeed * dt;
+    // Warmup countdown
+    state.warmupLeft = Math.max(0, state.warmupLeft - dt);
+
+    // move road toward car
+    const dz = state.roadSpeed * dt;
     for (const s of segments) { s.zStart -= dz; s.zEnd -= dz; }
-    while (segments.length && segments[0].zEnd < -280) segments.shift();
+    while (segments.length && segments[0].zEnd < -320) segments.shift();
     extendSegmentsIfNeeded();
 
-    // compute current lean acceleration
+    // drift accel
     const leanAcc = clamp(state.leanAccBase + state.score * state.leanAccRamp, state.leanAccBase, state.leanAccMax);
 
-    // apply constant lean acceleration
-    player.vx += player.leanDir * leanAcc * dt;
+    // apply drift
+    car.vx += car.driftDir * leanAcc * dt;
 
-    // damping & cap
-    player.vx *= Math.exp(-state.friction * dt);
-    player.vx = clamp(player.vx, -state.maxVx, state.maxVx);
+    // damping/cap
+    car.vx *= Math.exp(-state.friction * dt);
+    car.vx = clamp(car.vx, -state.maxVx, state.maxVx);
 
     // integrate
-    player.x += player.vx * dt;
+    car.x += car.vx * dt;
 
-    // track at player
     const tr = trackAtZ(0);
     if (!tr) return;
 
-    const pad = player.r + 2;
+    // Lane bounds with padding
+    const pad = car.r + 4;
     const left  = tr.center - tr.halfW + pad;
     const right = tr.center + tr.halfW - pad;
 
-    // grace: clamp in-bounds briefly so first second feels fair
+    // ✅ Always clamp during grace to prevent instant death
     if (state.graceLeft > 0) {
       state.graceLeft = Math.max(0, state.graceLeft - dt);
-      player.x = clamp(player.x, left, right);
+      car.x = clamp(car.x, left, right);
     }
 
-    // death check
-    const edgeDist = tr.halfW - Math.abs(player.x - tr.center) - player.r;
+    // Death check
+    const edgeDist = tr.halfW - Math.abs(car.x - tr.center) - car.r;
     if (edgeDist < 0) {
       endRun(Math.abs(edgeDist));
       return;
     }
 
-    // ramps
-    state.worldSpeed += state.baseAccel * dt;
+    // speed ramp baseline
+    state.roadSpeed += state.baseAccel * dt;
 
-    // segment pass events: when segment ends cross below 0
+    // pass events: when segment ends cross below 0
     for (const s of segments) {
       if (!s.passed && s.zEnd < 0) {
         s.passed = true;
-        state.worldSpeed += state.speedRamp;
+        state.roadSpeed += state.speedRamp;
 
-        // occasional auto-flip keeps you honest, but not random chaos
-        if (Math.random() < 0.12) player.leanDir *= -1;
+        // light spice later, not during warmup
+        if (state.warmupLeft <= 0 && Math.random() < 0.10) car.driftDir *= -1;
       }
     }
   }
@@ -290,13 +319,14 @@
     ctx.save();
     ctx.translate(sx, sy);
 
+    // background
     ctx.fillStyle = '#0b0b10';
     ctx.fillRect(-50,-50,W+100,H+100);
 
-    // beam ribbon
-    const samples = 34;
-    const zFar = 1200;
-    const zNear = -40;
+    // road ribbon points
+    const samples = 36;
+    const zFar = 1300;
+    const zNear = -60;
 
     let leftPts = [];
     let rightPts = [];
@@ -307,10 +337,12 @@
 
       const y = zToY(tz);
       const sc = zToScale(tz);
+
       leftPts.push({ x: tr.center - tr.halfW * sc, y });
       rightPts.push({ x: tr.center + tr.halfW * sc, y });
     }
 
+    // road fill
     ctx.beginPath();
     for (let i=0; i<leftPts.length; i++) {
       const p = leftPts[i];
@@ -324,8 +356,8 @@
     ctx.fillStyle = '#141421';
     ctx.fill();
 
-    // glow edges
-    ctx.globalAlpha = 0.6;
+    // lane edges
+    ctx.globalAlpha = 0.75;
     ctx.strokeStyle = '#4ad7ff';
     ctx.lineWidth = 2;
 
@@ -344,50 +376,73 @@
     ctx.stroke();
     ctx.globalAlpha = 1;
 
-    // player shadow + player
-    ctx.globalAlpha = 0.25;
+    // center dashes (visual speed)
+    ctx.globalAlpha = 0.35;
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2;
+    for (let i=0; i<10; i++) {
+      const y = (H*0.20) + i*70 + ((state.t*state.roadSpeed*0.25) % 70);
+      ctx.beginPath();
+      ctx.moveTo(W*0.5, y);
+      ctx.lineTo(W*0.5, y+24);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // car shadow
+    ctx.globalAlpha = 0.28;
     ctx.fillStyle = '#000';
     ctx.beginPath();
-    ctx.ellipse(player.x, player.y + 14, 18, 8, 0, 0, Math.PI*2);
+    ctx.ellipse(car.x, car.y + 16, 22, 9, 0, 0, Math.PI*2);
     ctx.fill();
     ctx.globalAlpha = 1;
 
+    // car body (simple)
+    ctx.save();
+    ctx.translate(car.x, car.y);
+    const tilt = clamp(car.vx / 900, -0.35, 0.35);
+    ctx.rotate(tilt);
     ctx.fillStyle = '#f2f2f5';
-    ctx.beginPath();
-    ctx.arc(player.x, player.y, player.r, 0, Math.PI*2);
-    ctx.fill();
+    ctx.fillRect(-16, -10, 32, 20);
+    ctx.fillStyle = '#0b0b10';
+    ctx.fillRect(-6, -7, 12, 6); // windshield
+    ctx.restore();
+
+    // drift arrow indicator
+    ctx.globalAlpha = 0.85;
+    ctx.fillStyle = '#ffd54a';
+    ctx.font = '900 22px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+    ctx.fillText(car.driftDir > 0 ? '→' : '←', 18, 82);
+    ctx.globalAlpha = 1;
 
     // HUD
     ctx.fillStyle = '#f2f2f5';
-    ctx.font = '800 22px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+    ctx.font = '900 22px system-ui, -apple-system, Segoe UI, Roboto, Arial';
     ctx.fillText(`Score: ${state.score}`, 18, 34);
 
     ctx.globalAlpha = 0.75;
-    ctx.font = '700 16px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+    ctx.font = '800 16px system-ui, -apple-system, Segoe UI, Roboto, Arial';
     ctx.fillText(`Best: ${state.best}`, 18, 56);
-
-    // show lean dir
-    ctx.fillText(`Lean: ${player.leanDir > 0 ? '→' : '←'}`, 18, 78);
     ctx.globalAlpha = 1;
 
     if (state.running) {
       ctx.globalAlpha = 0.75;
-      ctx.font = '700 16px system-ui, -apple-system, Segoe UI, Roboto, Arial';
-      ctx.fillText('Tap = flip lean direction. Flip closer to edge = more points.', 18, H - 20);
+      ctx.font = '800 16px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+      ctx.fillText('Tap = flip drift. Flip closer to edge = more points.', 18, H - 20);
       ctx.globalAlpha = 1;
     } else {
       ctx.globalAlpha = 0.95;
-      ctx.font = '900 52px system-ui, -apple-system, Segoe UI, Roboto, Arial';
-      ctx.fillText('MISSTEP', 18, H * 0.35);
+      ctx.font = '900 54px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+      ctx.fillText('ALMOST: DRIFT', 18, H * 0.35);
 
       ctx.globalAlpha = 0.85;
-      ctx.font = '800 26px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+      ctx.font = '900 26px system-ui, -apple-system, Segoe UI, Roboto, Arial';
       const miss = (state.lastMissPx == null) ? '' : `Missed by ${Math.max(0, state.lastMissPx).toFixed(1)} px`;
-      ctx.fillText(miss, 18, H * 0.35 + 44);
+      ctx.fillText(miss, 18, H * 0.35 + 46);
 
       ctx.globalAlpha = 0.85;
-      ctx.font = '800 18px system-ui, -apple-system, Segoe UI, Roboto, Arial';
-      ctx.fillText('Tap to retry', 18, H * 0.35 + 76);
+      ctx.font = '900 18px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+      ctx.fillText('Tap to retry', 18, H * 0.35 + 80);
       ctx.globalAlpha = 1;
     }
 
