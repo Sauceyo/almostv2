@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
-  <title>ALMOST: MISSTEP — Prototype</title>
+  <title>ALMOST: MISSTEP — Prototype v0.2</title>
   <style>
     html, body { margin:0; padding:0; background:#0b0b10; height:100%; overflow:hidden; }
     canvas { display:block; width:100vw; height:100vh; touch-action:manipulation; }
@@ -18,6 +18,7 @@
   if (!ctx) { document.body.innerHTML = '<div style="color:#fff;padding:16px;font:16px system-ui">Canvas unsupported.</div>'; return; }
 
   const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+  const lerp = (a,b,t)=>a+(b-a)*t;
 
   function resize() {
     const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
@@ -37,67 +38,131 @@
     shake: 0,
     t: 0,
 
-    // "forward" motion: segments move toward player
-    worldSpeed: 420, // px/s (visual forward speed)
-    speedRamp: 6,    // per segment passed
+    // forward speed
+    worldSpeed: 420,
+    speedRamp: 6,
 
-    // difficulty: drift grows over time
-    driftBase: 160,        // px/s^2
-    driftRamp: 14,         // increases with score
-    driftMax: 820,         // cap
-    driftDir: 1,           // current lean direction (+1 right / -1 left)
-    driftFlipChance: 0.22, // chance to flip direction on each new segment
+    // drift difficulty
+    driftBase: 150,   // px/s^2
+    driftRamp: 12,
+    driftMax: 720,
+    driftDir: 1,
+    driftFlipChance: 0.22,
 
-    // correction impulse
-    correction: 540,   // px/s impulse toward center
-    imperfection: 0.22, // % randomness in correction
+    // TAP CONTROL (changed):
+    // Tap now sets a target + applies a controlled "steer" (no overshoot)
+    tapSteerStrength: 26,   // higher = stronger snap toward center
+    tapNudge: 0.75,         // how far toward center a tap sets your target (0..1)
+    maxSteerSpeed: 560,     // px/s cap on sideways velocity
 
-    // scoring tiers (distance from edge at tap time, in px)
+    // scoring tiers (distance from edge at tap)
     closePx: 18,
     almostPx: 8,
+
+    // spawn safety
+    spawnGrace: 0.55, // seconds clamped safely on start
+    graceLeft: 0,
   };
 
-  // Player lives near bottom; only x changes.
   const player = {
     x: 0,
     y: 0,
     r: 12,
     vx: 0,
-    // friction keeps things controllable
-    friction: 7.5, // higher = snappier damp
+    friction: 9.5,
+    targetX: null, // where the player is trying to be (set on tap)
   };
 
-  // Track segments define where the beam is.
-  // Each segment has a centerX and halfWidth at that depth.
   let segments = [];
 
-  // Perspective mapping: world Z -> screen Y and scale
+  // Perspective mapping
   function zToY(z) {
-    // z=0 at player, increases away from player (up screen)
-    // We map so far segments are near top and small
     const H = window.innerHeight;
-    const nearY = H * 0.82;  // player line
-    const farY  = H * 0.12;  // horizon
-    const t = clamp(z / 1200, 0, 1); // 0..1
-    // ease so movement feels depthy
+    const nearY = H * 0.82;
+    const farY  = H * 0.12;
+    const t = clamp(z / 1200, 0, 1);
     const e = t*t*(3-2*t);
     return nearY + (farY - nearY) * e;
   }
-
   function zToScale(z) {
-    // scale smaller as z increases
     const t = clamp(z / 1200, 0, 1);
     return 1.0 - 0.62 * t;
   }
 
-  function currentTrackAtPlayer() {
-    // Find segment spanning z ~ 0
-    // Our segments are ordered by zStart..zEnd
-    for (const s of segments) {
-      if (0 >= s.zStart && 0 < s.zEnd) return s;
+  function seedSegments() {
+    const W = window.innerWidth;
+    let z = -220;
+    let center = W * 0.5;
+    let halfW = 125;
+
+    segments = [];
+    for (let i = 0; i < 12; i++) {
+      const len = 180 + Math.random() * 120;
+      const maxShift = 120; // keep early fair
+      const nextCenter = clamp(center + (Math.random()*2 - 1) * maxShift, W*0.22, W*0.78);
+      const nextHalfW  = clamp(halfW + (Math.random()*2 - 1) * 18, 72, 160);
+
+      segments.push({
+        zStart: z,
+        zEnd: z + len,
+        c0: center,
+        c1: nextCenter,
+        w0: halfW,
+        w1: nextHalfW,
+      });
+
+      z += len;
+      center = nextCenter;
+      halfW  = nextHalfW;
     }
-    // Fallback: nearest
-    return segments.length ? segments[0] : null;
+  }
+
+  function extendSegmentsIfNeeded() {
+    const W = window.innerWidth;
+    let farEnd = segments.length ? segments[segments.length - 1].zEnd : 0;
+
+    while (farEnd < 1750) {
+      const last = segments[segments.length - 1];
+      const len = 170 + Math.random() * 140;
+      const lastCenter = last ? last.c1 : W*0.5;
+      const lastHalfW  = last ? last.w1 : 125;
+
+      const maxShift = clamp(170 - state.score * 1.6, 85, 170);
+      const nextCenter = clamp(lastCenter + (Math.random()*2 - 1) * maxShift, W*0.18, W*0.82);
+      const nextHalfW  = clamp(lastHalfW + (Math.random()*2 - 1) * 22, 62, 165);
+
+      segments.push({
+        zStart: farEnd,
+        zEnd: farEnd + len,
+        c0: lastCenter,
+        c1: nextCenter,
+        w0: lastHalfW,
+        w1: nextHalfW,
+      });
+
+      farEnd += len;
+    }
+  }
+
+  function trackAtZ(z) {
+    for (const s of segments) {
+      if (z >= s.zStart && z < s.zEnd) {
+        const segT = clamp((z - s.zStart) / (s.zEnd - s.zStart), 0, 1);
+        const center = lerp(s.c0, s.c1, segT);
+        const halfW  = lerp(s.w0, s.w1, segT);
+        return { center, halfW, seg: s };
+      }
+    }
+    // fallback
+    if (segments.length) {
+      const s = segments[0];
+      return { center: s.c0, halfW: s.w0, seg: s };
+    }
+    return null;
+  }
+
+  function maybeFlipDriftOnPass() {
+    if (Math.random() < state.driftFlipChance) state.driftDir *= -1;
   }
 
   function reset() {
@@ -112,138 +177,48 @@
     state.driftDir = Math.random() < 0.5 ? -1 : 1;
 
     player.y = window.innerHeight * 0.82;
-    player.x = window.innerWidth * 0.5;
     player.vx = 0;
+    player.targetX = null;
 
-    segments = [];
     seedSegments();
-  }
+    extendSegmentsIfNeeded();
 
-  function seedSegments() {
-    const W = window.innerWidth;
+    // ✅ Spawn safe: snap player onto current track center with padding
+    const tr = trackAtZ(0);
+    const pad = player.r + 6;
+    player.x = clamp(tr.center, tr.center - (tr.halfW - pad), tr.center + (tr.halfW - pad));
 
-    // Beam "design" is defined in world space:
-    // z goes from near (- small) to far (+).
-    // We'll keep a chain from z=-200 to z=1600
-    let z = -200;
-    let center = W * 0.5;
-    let halfW = 120;
-
-    for (let i = 0; i < 10; i++) {
-      const len = 180 + Math.random() * 120; // segment length in z
-      const nextCenter = clamp(
-        center + (Math.random()*2 - 1) * 160,
-        W * 0.20,
-        W * 0.80
-      );
-      const nextHalfW = clamp(
-        halfW + (Math.random()*2 - 1) * 28,
-        64,
-        150
-      );
-
-      segments.push({
-        zStart: z,
-        zEnd: z + len,
-        c0: center,
-        c1: nextCenter,
-        w0: halfW,
-        w1: nextHalfW,
-        // subtle texture seed
-        tint: (Math.random()*0.15) + 0.07
-      });
-
-      z += len;
-      center = nextCenter;
-      halfW = nextHalfW;
-    }
-  }
-
-  function extendSegmentsIfNeeded() {
-    const W = window.innerWidth;
-    // ensure we have enough far segments
-    let farEnd = segments.length ? segments[segments.length - 1].zEnd : 0;
-    while (farEnd < 1700) {
-      const last = segments[segments.length - 1];
-
-      const len = 170 + Math.random() * 140;
-      const lastCenter = last ? last.c1 : W*0.5;
-      const lastHalfW  = last ? last.w1 : 120;
-
-      // fairness: limit how much center shifts per segment based on difficulty
-      const maxShift = clamp(190 - state.score * 1.8, 80, 190);
-
-      let nextCenter = clamp(
-        lastCenter + (Math.random()*2 - 1) * maxShift,
-        W * 0.18,
-        W * 0.82
-      );
-
-      let nextHalfW = clamp(
-        lastHalfW + (Math.random()*2 - 1) * 26,
-        58,
-        150
-      );
-
-      segments.push({
-        zStart: farEnd,
-        zEnd: farEnd + len,
-        c0: lastCenter,
-        c1: nextCenter,
-        w0: lastHalfW,
-        w1: nextHalfW,
-        tint: (Math.random()*0.15) + 0.07
-      });
-
-      farEnd += len;
-    }
-  }
-
-  function maybeFlipDriftOnPass() {
-    if (Math.random() < state.driftFlipChance) state.driftDir *= -1;
-  }
-
-  function action() {
-    if (!state.running) { reset(); return; }
-
-    const track = currentTrackAtPlayer();
-    if (!track) return;
-
-    // compute center & edge distance at tap moment (for scoring)
-    const center = lerp(track.c0, track.c1, 0.5); // approximation for z~0 slice
-    const halfW  = lerp(track.w0, track.w1, 0.5);
-
-    const edgeDist = halfW - Math.abs(player.x - center) - player.r; // inside margin
-    awardTapScore(edgeDist);
-
-    // Apply correction impulse toward center, with imperfection
-    const dir = (center - player.x);
-    const sign = dir === 0 ? 0 : (dir > 0 ? 1 : -1);
-
-    // randomness makes it feel “human” and prevents perfect autopilot play
-    const noise = (Math.random()*2 - 1) * state.imperfection;
-
-    player.vx += sign * state.correction * (1 + noise);
-
-    // Small kick also slightly reduces speed runaway
-    state.flash = Math.max(state.flash, 0.06);
+    // ✅ Grace window: prevents “spawn in wall” deaths and feels fair
+    state.graceLeft = state.spawnGrace;
   }
 
   function awardTapScore(edgeDist) {
-    // If edgeDist is negative, you're already off (will die), but guard anyway
     if (edgeDist <= state.almostPx) {
-      state.score += 3;
-      state.flash = 0.10;
-      state.shake = 7;
+      state.score += 3; state.flash = 0.10; state.shake = 7;
     } else if (edgeDist <= state.closePx) {
-      state.score += 2;
-      state.flash = Math.max(state.flash, 0.05);
+      state.score += 2; state.flash = Math.max(state.flash, 0.05);
     } else {
       state.score += 1;
     }
   }
 
-  function lerp(a,b,t){ return a + (b-a)*t; }
+  function action() {
+    if (!state.running) { reset(); return; }
+
+    const tr = trackAtZ(0);
+    if (!tr) return;
+
+    const edgeDist = tr.halfW - Math.abs(player.x - tr.center) - player.r;
+    awardTapScore(edgeDist);
+
+    // ✅ Tap sets a TARGET closer to center (not an impulse that can overshoot)
+    // tapNudge=0.75 means move 75% of the way toward center on each tap
+    const toCenter = tr.center - player.x;
+    player.targetX = player.x + toCenter * state.tapNudge;
+
+    // Tiny feedback
+    state.flash = Math.max(state.flash, 0.06);
+  }
 
   window.addEventListener('pointerdown', (e)=>{ e.preventDefault(); action(); }, {passive:false});
   window.addEventListener('keydown', (e)=>{
@@ -262,10 +237,8 @@
   function tick(t) {
     const dt = Math.min(0.033, (t-lastT)/1000);
     lastT = t;
-
     update(dt);
     render();
-
     requestAnimationFrame(tick);
   }
 
@@ -273,60 +246,59 @@
     state.t += dt;
     state.flash = Math.max(0, state.flash - dt);
     state.shake = Math.max(0, state.shake - dt*30);
-
     if (!state.running) return;
 
-    // Move world toward player (decrease z)
+    // move world toward player
     const dz = state.worldSpeed * dt;
-    for (const s of segments) {
-      s.zStart -= dz;
-      s.zEnd   -= dz;
-    }
-
-    // Cull segments behind player
-    while (segments.length && segments[0].zEnd < -260) segments.shift();
-
-    // Extend ahead
+    for (const s of segments) { s.zStart -= dz; s.zEnd -= dz; }
+    while (segments.length && segments[0].zEnd < -280) segments.shift();
     extendSegmentsIfNeeded();
 
-    // Drift acceleration grows with score, but capped
+    // drift acceleration grows with score, capped
     const driftAcc = clamp(state.driftBase + state.score * state.driftRamp, state.driftBase, state.driftMax);
+
+    // Apply drift to sideways velocity
     player.vx += state.driftDir * driftAcc * dt;
 
-    // Damping
-    const damp = Math.exp(-player.friction * dt);
-    player.vx *= damp;
+    // ✅ Controlled steering toward target (set on tap)
+    if (player.targetX != null) {
+      const err = player.targetX - player.x;
+      // steering accel proportional to error
+      player.vx += err * state.tapSteerStrength * dt;
 
-    // Integrate
+      // if we’re basically there, clear target
+      if (Math.abs(err) < 2.0) player.targetX = null;
+    }
+
+    // damping + cap
+    player.vx *= Math.exp(-player.friction * dt);
+    player.vx = clamp(player.vx, -state.maxSteerSpeed, state.maxSteerSpeed);
+
+    // integrate
     player.x += player.vx * dt;
 
-    // Determine beam at player (z~0)
-    const track = currentTrackAtPlayer();
-    if (!track) return;
+    // track at player
+    const tr = trackAtZ(0);
+    if (!tr) return;
 
-    // compute beam center/width at z=0 by interpolating along the segment
-    const segT = clamp((0 - track.zStart) / (track.zEnd - track.zStart), 0, 1);
-    const center = lerp(track.c0, track.c1, segT);
-    const halfW  = lerp(track.w0, track.w1, segT);
+    const pad = player.r + 2;
+    const left  = tr.center - tr.halfW + pad;
+    const right = tr.center + tr.halfW - pad;
 
-    // Edge distance (inside)
-    const edgeDist = halfW - Math.abs(player.x - center) - player.r;
+    // ✅ Grace: clamp inside beam for first moments to avoid instant deaths
+    if (state.graceLeft > 0) {
+      state.graceLeft = Math.max(0, state.graceLeft - dt);
+      player.x = clamp(player.x, left, right);
+    }
 
-    // If off beam => death
+    // death check
+    const edgeDist = tr.halfW - Math.abs(player.x - tr.center) - player.r;
     if (edgeDist < 0) {
       endRun(Math.abs(edgeDist));
       return;
     }
 
-    // Increase speed gradually as you survive (feels like forward tension)
-    // But don't accelerate too hard; this game is about restraint not reaction
-    state.worldSpeed += 0.8 * dt;
-
-    // “Pass” events: when a segment’s end crosses z=0, ramp difficulty gently
-    // We'll detect by checking a segment that just crossed.
-    // Simple: if any segment has zStart < 0 and zEnd > 0, we’re in it; when zEnd crosses below 0, we passed it.
-    // We'll award a tiny speed ramp on pass by tracking last segment id via position threshold.
-    // (Lightweight: use a marker on segments once their zEnd goes below 0.)
+    // pass events: when a segment end crosses below 0, ramp speed a bit and maybe flip drift
     for (const s of segments) {
       if (!s.passed && s.zEnd < 0) {
         s.passed = true;
@@ -334,6 +306,9 @@
         maybeFlipDriftOnPass();
       }
     }
+
+    // gentle baseline acceleration
+    state.worldSpeed += 0.75 * dt;
   }
 
   function render() {
@@ -348,85 +323,63 @@
     ctx.save();
     ctx.translate(sx, sy);
 
-    // background
     ctx.fillStyle = '#0b0b10';
     ctx.fillRect(-50,-50,W+100,H+100);
 
-    // faint horizon haze
-    ctx.globalAlpha = 0.25;
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, H*0.10, W, 2);
-    ctx.globalAlpha = 1;
-
-    // Draw beam as a ribbon in perspective using segment slices
-    // We'll sample z from far to near for a smooth look.
+    // build ribbon points
     const samples = 34;
     const zFar = 1200;
     const zNear = -40;
 
-    // Build left/right points
     let leftPts = [];
     let rightPts = [];
-
-    for (let i = 0; i <= samples; i++) {
+    for (let i=0; i<=samples; i++) {
       const tz = zFar + (zNear - zFar) * (i / samples);
-
-      // find segment containing tz
-      let seg = null;
-      for (const s of segments) {
-        if (tz >= s.zStart && tz < s.zEnd) { seg = s; break; }
-      }
-      if (!seg) continue;
-
-      const segT = clamp((tz - seg.zStart) / (seg.zEnd - seg.zStart), 0, 1);
-      const center = lerp(seg.c0, seg.c1, segT);
-      const halfW = lerp(seg.w0, seg.w1, segT);
+      const tr = trackAtZ(tz);
+      if (!tr) continue;
 
       const y = zToY(tz);
       const sc = zToScale(tz);
 
-      leftPts.push({ x: center - halfW * sc, y });
-      rightPts.push({ x: center + halfW * sc, y });
+      leftPts.push({ x: tr.center - tr.halfW * sc, y });
+      rightPts.push({ x: tr.center + tr.halfW * sc, y });
     }
 
-    // Beam fill
+    // beam fill
     ctx.beginPath();
     for (let i=0; i<leftPts.length; i++) {
       const p = leftPts[i];
-      if (i===0) ctx.moveTo(p.x, p.y);
-      else ctx.lineTo(p.x, p.y);
+      if (i===0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
     }
     for (let i=rightPts.length-1; i>=0; i--) {
       const p = rightPts[i];
       ctx.lineTo(p.x, p.y);
     }
     ctx.closePath();
-
     ctx.fillStyle = '#141421';
     ctx.fill();
 
-    // Beam edge glow
+    // edge glow
     ctx.globalAlpha = 0.55;
     ctx.strokeStyle = '#4ad7ff';
     ctx.lineWidth = 2;
+
     ctx.beginPath();
     for (let i=0; i<leftPts.length; i++) {
       const p = leftPts[i];
-      if (i===0) ctx.moveTo(p.x, p.y);
-      else ctx.lineTo(p.x, p.y);
+      if (i===0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
     }
     ctx.stroke();
 
     ctx.beginPath();
     for (let i=0; i<rightPts.length; i++) {
       const p = rightPts[i];
-      if (i===0) ctx.moveTo(p.x, p.y);
-      else ctx.lineTo(p.x, p.y);
+      if (i===0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
     }
     ctx.stroke();
     ctx.globalAlpha = 1;
 
-    // Player shadow + player
+    // player shadow + player
     ctx.globalAlpha = 0.25;
     ctx.fillStyle = '#000';
     ctx.beginPath();
@@ -443,17 +396,15 @@
     ctx.fillStyle = '#f2f2f5';
     ctx.font = '800 22px system-ui, -apple-system, Segoe UI, Roboto, Arial';
     ctx.fillText(`Score: ${state.score}`, 18, 34);
-
     ctx.globalAlpha = 0.75;
     ctx.font = '700 16px system-ui, -apple-system, Segoe UI, Roboto, Arial';
     ctx.fillText(`Best: ${state.best}`, 18, 56);
     ctx.globalAlpha = 1;
 
-    // instructions / game over
     if (state.running) {
       ctx.globalAlpha = 0.75;
       ctx.font = '700 16px system-ui, -apple-system, Segoe UI, Roboto, Arial';
-      ctx.fillText('Tap = correct drift. Closer to the edge when you tap = more points.', 18, H - 20);
+      ctx.fillText('Tap = correct drift (safe). Closer to edge at tap = more points.', 18, H - 20);
       ctx.globalAlpha = 1;
     } else {
       ctx.globalAlpha = 0.95;
@@ -471,7 +422,6 @@
       ctx.globalAlpha = 1;
     }
 
-    // flash overlay
     if (state.flash > 0) {
       ctx.globalAlpha = clamp(state.flash * 3.5, 0, 0.32);
       ctx.fillStyle = '#ffffff';
