@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
-  <title>ALMOST: MISSTEP — Prototype v0.2</title>
+  <title>ALMOST: MISSTEP — v0.3 (Flip Lean)</title>
   <style>
     html, body { margin:0; padding:0; background:#0b0b10; height:100%; overflow:hidden; }
     canvas { display:block; width:100vw; height:100vh; touch-action:manipulation; }
@@ -29,53 +29,7 @@
   window.addEventListener('resize', resize);
   resize();
 
-  const state = {
-    running: true,
-    score: 0,
-    best: 0,
-    lastMissPx: null,
-    flash: 0,
-    shake: 0,
-    t: 0,
-
-    // forward speed
-    worldSpeed: 420,
-    speedRamp: 6,
-
-    // drift difficulty
-    driftBase: 150,   // px/s^2
-    driftRamp: 12,
-    driftMax: 720,
-    driftDir: 1,
-    driftFlipChance: 0.22,
-
-    // TAP CONTROL (changed):
-    // Tap now sets a target + applies a controlled "steer" (no overshoot)
-    tapSteerStrength: 26,   // higher = stronger snap toward center
-    tapNudge: 0.75,         // how far toward center a tap sets your target (0..1)
-    maxSteerSpeed: 560,     // px/s cap on sideways velocity
-
-    // scoring tiers (distance from edge at tap)
-    closePx: 18,
-    almostPx: 8,
-
-    // spawn safety
-    spawnGrace: 0.55, // seconds clamped safely on start
-    graceLeft: 0,
-  };
-
-  const player = {
-    x: 0,
-    y: 0,
-    r: 12,
-    vx: 0,
-    friction: 9.5,
-    targetX: null, // where the player is trying to be (set on tap)
-  };
-
-  let segments = [];
-
-  // Perspective mapping
+  // --- Perspective helpers ---
   function zToY(z) {
     const H = window.innerHeight;
     const nearY = H * 0.82;
@@ -89,27 +43,66 @@
     return 1.0 - 0.62 * t;
   }
 
+  const state = {
+    running: true,
+    score: 0,
+    best: 0,
+    lastMissPx: null,
+
+    flash: 0,
+    shake: 0,
+    t: 0,
+
+    // forward motion
+    worldSpeed: 420,
+    speedRamp: 6,
+    baseAccel: 0.75,
+
+    // BALANCE MECHANIC
+    // leanAcc is the sideways acceleration applied constantly.
+    leanAccBase: 900,     // px/s^2
+    leanAccRamp: 18,      // increases with score
+    leanAccMax: 1700,
+
+    // damping/cap so it's controllable
+    friction: 3.8,
+    maxVx: 860,
+
+    // scoring tiers (distance from edge when you flip)
+    closePx: 18,
+    almostPx: 8,
+
+    // start safety
+    spawnGrace: 0.45,
+    graceLeft: 0,
+  };
+
+  const player = {
+    x: 0,
+    y: 0,
+    r: 12,
+    vx: 0,
+    leanDir: 1, // +1 right / -1 left
+  };
+
+  let segments = [];
+
   function seedSegments() {
     const W = window.innerWidth;
     let z = -220;
     let center = W * 0.5;
-    let halfW = 125;
+    let halfW = 135;
 
     segments = [];
     for (let i = 0; i < 12; i++) {
       const len = 180 + Math.random() * 120;
-      const maxShift = 120; // keep early fair
-      const nextCenter = clamp(center + (Math.random()*2 - 1) * maxShift, W*0.22, W*0.78);
-      const nextHalfW  = clamp(halfW + (Math.random()*2 - 1) * 18, 72, 160);
 
-      segments.push({
-        zStart: z,
-        zEnd: z + len,
-        c0: center,
-        c1: nextCenter,
-        w0: halfW,
-        w1: nextHalfW,
-      });
+      // early fairness: gentle offsets
+      const maxShift = 110;
+      const nextCenter = clamp(center + (Math.random()*2 - 1) * maxShift, W*0.22, W*0.78);
+      const nextHalfW  = clamp(halfW + (Math.random()*2 - 1) * 16, 78, 175);
+
+      segments.push({ zStart:z, zEnd:z+len, c0:center, c1:nextCenter, w0:halfW, w1:nextHalfW });
 
       z += len;
       center = nextCenter;
@@ -124,22 +117,17 @@
     while (farEnd < 1750) {
       const last = segments[segments.length - 1];
       const len = 170 + Math.random() * 140;
+
       const lastCenter = last ? last.c1 : W*0.5;
-      const lastHalfW  = last ? last.w1 : 125;
+      const lastHalfW  = last ? last.w1 : 135;
 
-      const maxShift = clamp(170 - state.score * 1.6, 85, 170);
+      // as score rises, reduce max shift so it stays fair at high speed
+      const maxShift = clamp(170 - state.score * 1.4, 85, 170);
+
       const nextCenter = clamp(lastCenter + (Math.random()*2 - 1) * maxShift, W*0.18, W*0.82);
-      const nextHalfW  = clamp(lastHalfW + (Math.random()*2 - 1) * 22, 62, 165);
+      const nextHalfW  = clamp(lastHalfW + (Math.random()*2 - 1) * 20, 74, 185);
 
-      segments.push({
-        zStart: farEnd,
-        zEnd: farEnd + len,
-        c0: lastCenter,
-        c1: nextCenter,
-        w0: lastHalfW,
-        w1: nextHalfW,
-      });
-
+      segments.push({ zStart:farEnd, zEnd:farEnd+len, c0:lastCenter, c1:nextCenter, w0:lastHalfW, w1:nextHalfW });
       farEnd += len;
     }
   }
@@ -148,21 +136,12 @@
     for (const s of segments) {
       if (z >= s.zStart && z < s.zEnd) {
         const segT = clamp((z - s.zStart) / (s.zEnd - s.zStart), 0, 1);
-        const center = lerp(s.c0, s.c1, segT);
-        const halfW  = lerp(s.w0, s.w1, segT);
-        return { center, halfW, seg: s };
+        return { center: lerp(s.c0, s.c1, segT), halfW: lerp(s.w0, s.w1, segT), seg: s };
       }
     }
-    // fallback
-    if (segments.length) {
-      const s = segments[0];
-      return { center: s.c0, halfW: s.w0, seg: s };
-    }
-    return null;
-  }
-
-  function maybeFlipDriftOnPass() {
-    if (Math.random() < state.driftFlipChance) state.driftDir *= -1;
+    if (!segments.length) return null;
+    const s = segments[0];
+    return { center: s.c0, halfW: s.w0, seg: s };
   }
 
   function reset() {
@@ -174,25 +153,31 @@
     state.t = 0;
 
     state.worldSpeed = 420;
-    state.driftDir = Math.random() < 0.5 ? -1 : 1;
+    state.graceLeft = state.spawnGrace;
 
     player.y = window.innerHeight * 0.82;
     player.vx = 0;
-    player.targetX = null;
+    player.leanDir = Math.random() < 0.5 ? -1 : 1;
 
     seedSegments();
     extendSegmentsIfNeeded();
 
-    // ✅ Spawn safe: snap player onto current track center with padding
+    // snap onto track center so you never spawn dead
     const tr = trackAtZ(0);
     const pad = player.r + 6;
     player.x = clamp(tr.center, tr.center - (tr.halfW - pad), tr.center + (tr.halfW - pad));
-
-    // ✅ Grace window: prevents “spawn in wall” deaths and feels fair
-    state.graceLeft = state.spawnGrace;
   }
 
-  function awardTapScore(edgeDist) {
+  function endRun(missPx) {
+    state.running = false;
+    state.best = Math.max(state.best, state.score);
+    state.lastMissPx = missPx;
+    state.flash = 0.28;
+    state.shake = 12;
+  }
+
+  function awardFlipScore(edgeDist) {
+    // smaller edgeDist = closer to falling = more points
     if (edgeDist <= state.almostPx) {
       state.score += 3; state.flash = 0.10; state.shake = 7;
     } else if (edgeDist <= state.closePx) {
@@ -205,19 +190,15 @@
   function action() {
     if (!state.running) { reset(); return; }
 
+    // Flip lean direction (THIS gives you agency)
+    player.leanDir *= -1;
+
+    // score based on how close you were to the edge when you flipped
     const tr = trackAtZ(0);
-    if (!tr) return;
-
-    const edgeDist = tr.halfW - Math.abs(player.x - tr.center) - player.r;
-    awardTapScore(edgeDist);
-
-    // ✅ Tap sets a TARGET closer to center (not an impulse that can overshoot)
-    // tapNudge=0.75 means move 75% of the way toward center on each tap
-    const toCenter = tr.center - player.x;
-    player.targetX = player.x + toCenter * state.tapNudge;
-
-    // Tiny feedback
-    state.flash = Math.max(state.flash, 0.06);
+    if (tr) {
+      const edgeDist = tr.halfW - Math.abs(player.x - tr.center) - player.r;
+      awardFlipScore(edgeDist);
+    }
   }
 
   window.addEventListener('pointerdown', (e)=>{ e.preventDefault(); action(); }, {passive:false});
@@ -225,20 +206,14 @@
     if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); action(); }
   });
 
-  function endRun(missPx) {
-    state.running = false;
-    state.best = Math.max(state.best, state.score);
-    state.lastMissPx = missPx;
-    state.flash = 0.28;
-    state.shake = 12;
-  }
-
   let lastT = performance.now();
   function tick(t) {
     const dt = Math.min(0.033, (t-lastT)/1000);
     lastT = t;
+
     update(dt);
     render();
+
     requestAnimationFrame(tick);
   }
 
@@ -254,25 +229,15 @@
     while (segments.length && segments[0].zEnd < -280) segments.shift();
     extendSegmentsIfNeeded();
 
-    // drift acceleration grows with score, capped
-    const driftAcc = clamp(state.driftBase + state.score * state.driftRamp, state.driftBase, state.driftMax);
+    // compute current lean acceleration
+    const leanAcc = clamp(state.leanAccBase + state.score * state.leanAccRamp, state.leanAccBase, state.leanAccMax);
 
-    // Apply drift to sideways velocity
-    player.vx += state.driftDir * driftAcc * dt;
+    // apply constant lean acceleration
+    player.vx += player.leanDir * leanAcc * dt;
 
-    // ✅ Controlled steering toward target (set on tap)
-    if (player.targetX != null) {
-      const err = player.targetX - player.x;
-      // steering accel proportional to error
-      player.vx += err * state.tapSteerStrength * dt;
-
-      // if we’re basically there, clear target
-      if (Math.abs(err) < 2.0) player.targetX = null;
-    }
-
-    // damping + cap
-    player.vx *= Math.exp(-player.friction * dt);
-    player.vx = clamp(player.vx, -state.maxSteerSpeed, state.maxSteerSpeed);
+    // damping & cap
+    player.vx *= Math.exp(-state.friction * dt);
+    player.vx = clamp(player.vx, -state.maxVx, state.maxVx);
 
     // integrate
     player.x += player.vx * dt;
@@ -285,7 +250,7 @@
     const left  = tr.center - tr.halfW + pad;
     const right = tr.center + tr.halfW - pad;
 
-    // ✅ Grace: clamp inside beam for first moments to avoid instant deaths
+    // grace: clamp in-bounds briefly so first second feels fair
     if (state.graceLeft > 0) {
       state.graceLeft = Math.max(0, state.graceLeft - dt);
       player.x = clamp(player.x, left, right);
@@ -298,17 +263,19 @@
       return;
     }
 
-    // pass events: when a segment end crosses below 0, ramp speed a bit and maybe flip drift
+    // ramps
+    state.worldSpeed += state.baseAccel * dt;
+
+    // segment pass events: when segment ends cross below 0
     for (const s of segments) {
       if (!s.passed && s.zEnd < 0) {
         s.passed = true;
         state.worldSpeed += state.speedRamp;
-        maybeFlipDriftOnPass();
+
+        // occasional auto-flip keeps you honest, but not random chaos
+        if (Math.random() < 0.12) player.leanDir *= -1;
       }
     }
-
-    // gentle baseline acceleration
-    state.worldSpeed += 0.75 * dt;
   }
 
   function render() {
@@ -326,7 +293,7 @@
     ctx.fillStyle = '#0b0b10';
     ctx.fillRect(-50,-50,W+100,H+100);
 
-    // build ribbon points
+    // beam ribbon
     const samples = 34;
     const zFar = 1200;
     const zNear = -40;
@@ -340,12 +307,10 @@
 
       const y = zToY(tz);
       const sc = zToScale(tz);
-
       leftPts.push({ x: tr.center - tr.halfW * sc, y });
       rightPts.push({ x: tr.center + tr.halfW * sc, y });
     }
 
-    // beam fill
     ctx.beginPath();
     for (let i=0; i<leftPts.length; i++) {
       const p = leftPts[i];
@@ -359,8 +324,8 @@
     ctx.fillStyle = '#141421';
     ctx.fill();
 
-    // edge glow
-    ctx.globalAlpha = 0.55;
+    // glow edges
+    ctx.globalAlpha = 0.6;
     ctx.strokeStyle = '#4ad7ff';
     ctx.lineWidth = 2;
 
@@ -396,15 +361,19 @@
     ctx.fillStyle = '#f2f2f5';
     ctx.font = '800 22px system-ui, -apple-system, Segoe UI, Roboto, Arial';
     ctx.fillText(`Score: ${state.score}`, 18, 34);
+
     ctx.globalAlpha = 0.75;
     ctx.font = '700 16px system-ui, -apple-system, Segoe UI, Roboto, Arial';
     ctx.fillText(`Best: ${state.best}`, 18, 56);
+
+    // show lean dir
+    ctx.fillText(`Lean: ${player.leanDir > 0 ? '→' : '←'}`, 18, 78);
     ctx.globalAlpha = 1;
 
     if (state.running) {
       ctx.globalAlpha = 0.75;
       ctx.font = '700 16px system-ui, -apple-system, Segoe UI, Roboto, Arial';
-      ctx.fillText('Tap = correct drift (safe). Closer to edge at tap = more points.', 18, H - 20);
+      ctx.fillText('Tap = flip lean direction. Flip closer to edge = more points.', 18, H - 20);
       ctx.globalAlpha = 1;
     } else {
       ctx.globalAlpha = 0.95;
