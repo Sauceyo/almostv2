@@ -58,3 +58,292 @@
 
     flash: 0,
     shake: 0,
+
+    t: 0,
+  };
+
+  const player = {
+    x: 140,
+    y: 200,
+    r: 13,
+    vy: 0,
+
+    gravity: 1700,
+    flapImpulse: 540,
+    maxFall: 1200,
+  };
+
+  let shutters = [];
+  let spawnTimer = 0;
+
+  const neon = ['#2cffc7', '#7c5cff', '#ff3d81', '#ffd54a', '#4ad7ff'];
+  const pick = () => neon[(Math.random()*neon.length)|0];
+
+  function reset() {
+    state.running = true;
+    state.score = 0;
+    state.lastMissPx = null;
+
+    state.speed = 280;
+    state.spawnEvery = 0.95;
+    state.slotH = 160;
+
+    state.flash = 0;
+    state.shake = 0;
+    state.t = 0;
+
+    player.y = window.innerHeight * 0.5;
+    player.vy = 0;
+
+    shutters = [];
+    spawnTimer = 0.2;
+  }
+
+  function spawnShutter() {
+    const W = window.innerWidth, H = window.innerHeight;
+
+    const margin = 60;
+    const slotH = Math.max(state.slotMin, state.slotH);
+    const slotY = margin + Math.random() * (H - margin*2 - slotH);
+
+    shutters.push({
+      x: W + 60,
+      w: 92,
+      slotY,
+      slotH,
+      color: pick(),
+      passed: false,
+
+      // subtle drift so it feels alive and different
+      driftAmp: 18 + Math.random()*18,
+      driftSpd: 0.9 + Math.random()*0.7,
+      driftPhase: Math.random()*Math.PI*2,
+    });
+  }
+
+  function action() {
+    if (!state.running) { reset(); return; }
+    player.vy = -player.flapImpulse;
+  }
+
+  window.addEventListener('pointerdown', (e)=>{ e.preventDefault(); action(); }, {passive:false});
+  window.addEventListener('keydown', (e)=>{
+    if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); action(); }
+  });
+
+  function endRun(missPx) {
+    state.running = false;
+    state.best = Math.max(state.best, state.score);
+    state.lastMissPx = missPx;
+    state.flash = 0.28;
+    state.shake = 11;
+  }
+
+  function tierScore(edgeDist) {
+    // edgeDist = distance from player edge to nearest slot edge (inside slot). smaller => closer
+    if (edgeDist <= state.almostPx) {
+      state.score += 3; state.flash = 0.09; state.shake = 7;
+    } else if (edgeDist <= state.closePx) {
+      state.score += 2;
+    } else {
+      state.score += 1;
+    }
+
+    // ramp
+    state.speed += state.speedRamp;
+    state.spawnEvery = Math.max(state.spawnMin, state.spawnEvery - 0.02);
+    state.slotH = Math.max(state.slotMin, state.slotH - state.slotShrink);
+  }
+
+  let lastT = performance.now();
+  function tick(t) {
+    const dt = Math.min(0.033, (t-lastT)/1000);
+    lastT = t;
+
+    try {
+      update(dt);
+      render();
+    } catch (err) {
+      // If anything breaks, show the error on screen instead of black-screening.
+      ctx.setTransform(1,0,0,1,0,0);
+      ctx.fillStyle = '#0b0b10';
+      ctx.fillRect(0,0,canvas.width,canvas.height);
+      ctx.fillStyle = '#ff6b6b';
+      ctx.font = '16px system-ui';
+      ctx.fillText('Error: ' + (err && err.message ? err.message : String(err)), 16, 32);
+      console.error(err);
+      return;
+    }
+
+    requestAnimationFrame(tick);
+  }
+
+  function update(dt) {
+    state.t += dt;
+    state.flash = Math.max(0, state.flash - dt);
+    state.shake = Math.max(0, state.shake - dt*30);
+
+    if (!state.running) return;
+
+    // player physics
+    player.vy += player.gravity * dt;
+    player.vy = clamp(player.vy, -2000, player.maxFall);
+    player.y += player.vy * dt;
+
+    const H = window.innerHeight;
+    if (player.y < player.r + 6) endRun(Math.abs(player.y - (player.r + 6)));
+    if (player.y > H - (player.r + 6)) endRun(Math.abs(player.y - (H - (player.r + 6))));
+
+    // spawn shutters
+    spawnTimer -= dt;
+    if (spawnTimer <= 0) {
+      spawnTimer = state.spawnEvery;
+      spawnShutter();
+    }
+
+    // move shutters
+    for (const s of shutters) s.x -= state.speed * dt;
+    while (shutters.length && shutters[0].x < -250) shutters.shift();
+
+    // collisions + pass scoring
+    for (const s of shutters) {
+      // drift slot
+      const drift = Math.sin(state.t*s.driftSpd + s.driftPhase) * s.driftAmp;
+      const slotY = s.slotY + drift;
+      const slotTop = slotY;
+      const slotBot = slotY + s.slotH;
+
+      // only consider when aligned in x
+      if (player.x + player.r < s.x || player.x - player.r > s.x + s.w) continue;
+
+      // inside slot?
+      const inside = (player.y - player.r >= slotTop) && (player.y + player.r <= slotBot);
+
+      if (!inside) {
+        // missPx: how far beyond the slot you are
+        let missPx = 0;
+        if (player.y < slotTop) missPx = (slotTop - (player.y + player.r));
+        else if (player.y > slotBot) missPx = ((player.y - player.r) - slotBot);
+        missPx = Math.max(0, missPx);
+        endRun(missPx);
+        return;
+      }
+
+      // pass scoring when shutter center passes player.x
+      if (!s.passed && (s.x + s.w/2) < player.x) {
+        s.passed = true;
+
+        const edgeDist = Math.min(
+          (player.y - player.r) - slotTop,
+          slotBot - (player.y + player.r)
+        ); // inside distance to nearest edge
+
+        tierScore(edgeDist);
+      }
+    }
+  }
+
+  function render() {
+    const W = window.innerWidth, H = window.innerHeight;
+
+    // shake
+    let sx=0, sy=0;
+    if (state.shake > 0) {
+      sx = (Math.random()-0.5)*state.shake;
+      sy = (Math.random()-0.5)*state.shake;
+    }
+
+    ctx.save();
+    ctx.translate(sx, sy);
+
+    // background
+    ctx.fillStyle = '#0b0b10';
+    ctx.fillRect(-50,-50,W+100,H+100);
+
+    // subtle diagonal scanlines (distinct identity)
+    ctx.globalAlpha = 0.07;
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1;
+    for (let i=-H; i<W; i+=28) {
+      ctx.beginPath();
+      ctx.moveTo(i, 0);
+      ctx.lineTo(i+H, H);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // shutters
+    for (const s of shutters) {
+      const drift = Math.sin(state.t*s.driftSpd + s.driftPhase) * s.driftAmp;
+      const slotY = s.slotY + drift;
+
+      // shutter body (one panel, not pipes)
+      ctx.fillStyle = '#141421';
+      ctx.fillRect(s.x, 0, s.w, H);
+
+      // slot opening (safe corridor)
+      ctx.clearRect(s.x, slotY, s.w, s.slotH);
+
+      // slot outline
+      ctx.strokeStyle = s.color;
+      ctx.lineWidth = 3;
+      ctx.strokeRect(s.x + 2, slotY + 2, s.w - 4, s.slotH - 4);
+
+      // accent edge
+      ctx.fillStyle = s.color;
+      ctx.fillRect(s.x + s.w - 6, 0, 4, H);
+    }
+
+    // player
+    ctx.fillStyle = '#f2f2f5';
+    ctx.beginPath();
+    ctx.arc(player.x, player.y, player.r, 0, Math.PI*2);
+    ctx.fill();
+
+    // HUD
+    ctx.fillStyle = '#f2f2f5';
+    ctx.font = '700 22px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+    ctx.fillText(`Score: ${state.score}`, 18, 34);
+    ctx.globalAlpha = 0.75;
+    ctx.font = '600 16px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+    ctx.fillText(`Best: ${state.best}`, 18, 56);
+    ctx.globalAlpha = 1;
+
+    if (state.running) {
+      ctx.globalAlpha = 0.75;
+      ctx.font = '600 16px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+      ctx.fillText('Tap = boost up (continuous). Hug the edges for more points.', 18, H - 20);
+      ctx.globalAlpha = 1;
+    } else {
+      ctx.globalAlpha = 0.95;
+      ctx.font = '900 56px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+      ctx.fillText('ALMOST', 18, H * 0.35);
+
+      ctx.globalAlpha = 0.85;
+      ctx.font = '800 26px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+      const miss = (state.lastMissPx == null) ? '' : `Missed by ${Math.max(0, state.lastMissPx).toFixed(1)} px`;
+      ctx.fillText(miss, 18, H * 0.35 + 46);
+
+      ctx.globalAlpha = 0.85;
+      ctx.font = '700 18px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+      ctx.fillText('Tap to retry', 18, H * 0.35 + 80);
+      ctx.globalAlpha = 1;
+    }
+
+    // flash overlay
+    if (state.flash > 0) {
+      ctx.globalAlpha = clamp(state.flash * 3.5, 0, 0.35);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(-50,-50,W+100,H+100);
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.restore();
+  }
+
+  reset();
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
