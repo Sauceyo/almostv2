@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
-  <title>ALMOST — Prototype v2</title>
+  <title>ALMOST — Prototype v2.1</title>
   <style>
     html, body { margin:0; padding:0; background:#0b0b10; height:100%; overflow:hidden; }
     canvas { display:block; width:100vw; height:100vh; touch-action:manipulation; }
@@ -14,8 +14,16 @@
 <script>
 (() => {
   const canvas = document.getElementById('c');
-  const ctx = canvas.getContext('2d', { alpha:false });
 
+  // Safer: try alpha:false, then fall back to default if a device doesn’t like it
+  let ctx = canvas.getContext('2d', { alpha: false });
+  if (!ctx) ctx = canvas.getContext('2d');
+  if (!ctx) {
+    document.body.innerHTML = '<div style="color:#fff;font:16px system-ui;padding:16px">Canvas not supported on this browser.</div>';
+    return;
+  }
+
+  // --- HiDPI canvas ---
   function resize() {
     const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
     canvas.width = Math.floor(window.innerWidth * dpr);
@@ -33,113 +41,20 @@
     best: 0,
     lastMissPx: null,
 
-    // world
-    speed: 270,           // px/s
-    speedRamp: 10,        // per obstacle
-    spawnEvery: 0.95,      // seconds (shrinks slightly over time)
+    speed: 280,
+    speedRamp: 10,
 
-    // aperture (hole) sizing
-    holeR: 66,            // radius of the circular "window" in shutter
-    holeMin: 36,
-    holeShrink: 0.8,      // per obstacle
+    spawnEvery: 0.95,
+    spawnMin: 0.58,
 
-    // proximity tiers (distance from player edge to hole edge)
+    // Slot (safe window) size
+    slotH: 160,
+    slotMin: 95,
+    slotShrink: 2.2,
+
+    // proximity tiers (distance from player edge to nearest slot edge)
     closePx: 14,
     almostPx: 6,
 
-    // juice
     flash: 0,
     shake: 0,
-
-    t: 0,
-  };
-
-  const player = {
-    x: 140,
-    y: 200,
-    r: 13,
-    vy: 0,
-
-    // physics
-    gravity: 1650,     // px/s^2
-    flapImpulse: 520,  // px/s up
-    maxFall: 1100,
-  };
-
-  let obstacles = [];
-  let spawnTimer = 0;
-
-  // Visual palette (simple, distinct)
-  const neon = ['#2cffc7', '#7c5cff', '#ff3d81', '#ffd54a', '#4ad7ff'];
-  const pick = () => neon[(Math.random()*neon.length)|0];
-
-  function reset() {
-    state.running = true;
-    state.score = 0;
-    state.lastMissPx = null;
-
-    state.speed = 270;
-    state.spawnEvery = 0.95;
-    state.holeR = 66;
-
-    state.flash = 0;
-    state.shake = 0;
-    state.t = 0;
-
-    player.y = window.innerHeight * 0.5;
-    player.vy = 0;
-
-    obstacles = [];
-    spawnTimer = 0.2;
-  }
-
-  function spawnObstacle() {
-    const W = window.innerWidth, H = window.innerHeight;
-
-    // hole center Y with margin so it’s always possible
-    const margin = state.holeR + 26;
-    const holeY = margin + Math.random() * (H - margin*2);
-
-    obstacles.push({
-      x: W + 60,
-      w: 90,
-      holeY,
-      holeR: state.holeR,
-      color: pick(),
-      passed: false,
-
-      // tiny drift so it feels alive (distinct from static pipes)
-      driftAmp: 22 + Math.random()*18,
-      driftSpd: 0.9 + Math.random()*0.7,
-      driftPhase: Math.random()*Math.PI*2,
-    });
-  }
-
-  function action() {
-    if (!state.running) { reset(); return; }
-    player.vy = -player.flapImpulse; // continuous control (not 2 positions)
-  }
-
-  window.addEventListener('pointerdown', (e)=>{ e.preventDefault(); action(); }, {passive:false});
-  window.addEventListener('keydown', (e)=>{
-    if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); action(); }
-  });
-
-  function circleRectHit(cx, cy, r, rx, ry, rw, rh) {
-    const nx = clamp(cx, rx, rx+rw);
-    const ny = clamp(cy, ry, ry+rh);
-    const dx = cx-nx, dy = cy-ny;
-    return (dx*dx + dy*dy) <= r*r;
-  }
-
-  function endRun(missPx) {
-    state.running = false;
-    state.best = Math.max(state.best, state.score);
-    state.lastMissPx = missPx;
-    state.flash = 0.28;
-    state.shake = 11;
-  }
-
-  function scoreProximity(o) {
-    // distance from player edge to hole edge at the moment the shutter passes
-    const dy
